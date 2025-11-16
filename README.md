@@ -28,6 +28,9 @@ PostgreSQL и pgAdmin были развернуты в Docker под WSL2
 Диаграмма:
 - https://disk.yandex.ru/i/Nin513nwow4gcg
 
+**upd:** в ходе решения 5 части и переделки, итоговая схема будет https://disk.yandex.ru/i/FWWNIyBPtnd7Iw 
+Датели в части 5.
+
 ---
 
 ## 3. Нормализация
@@ -64,7 +67,7 @@ PostgreSQL и pgAdmin были развернуты в Docker под WSL2
 ## 4. Создание таблиц
 
 ### Таблица customers
-
+```sql
 CREATE TABLE customers (
     customer_id int PRIMARY KEY,
     first_name varchar(100) NOT NULL,
@@ -82,10 +85,11 @@ CREATE TABLE customers (
     country varchar(100),
     property_valuation int
 );
+```
 Скрин: https://disk.yandex.ru/i/qr0qCWrgM5pzGw
 
 ### Таблица products
-
+```sql
 CREATE TABLE products (
     product_id int PRIMARY KEY,
     brand varchar(100) NOT NULL,
@@ -95,10 +99,11 @@ CREATE TABLE products (
     list_price numeric(10,2) NOT NULL,
     standard_cost numeric(10,2) NOT NULL
 );
+```
 Скрин: https://disk.yandex.ru/i/3rm-8L3prAp-fg
 
 ### Таблица transactions
-
+```sql
 CREATE TABLE transactions (
     transaction_id int PRIMARY KEY,
     product_id int NOT NULL,
@@ -111,6 +116,7 @@ CREATE TABLE transactions (
     CONSTRAINT fk_transactions_customer
         FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
 );
+```
 
 Скрин:
 
@@ -133,7 +139,190 @@ https://disk.yandex.ru/i/IJBF9HiKhNg1xg
 
 Скриншоты импорта:
 
+https://disk.yandex.ru/i/uFxzdBTRpBy3rg 
+
 https://disk.yandex.ru/i/dKXrWskRyIGhkg
 
 https://disk.yandex.ru/i/kSQVYkOd48MhDg
 
+https://disk.yandex.ru/i/KupRixtHeeaggg - запятые на точки поменял руками в гуглдокс.
+
+### В процессе импорта обнаружил битые данные,
+Пример битых данных:
+https://disk.yandex.ru/i/0uHtikX_OsPF3Q -  сначала думал это точечные проблемы... 
+
+https://disk.yandex.ru/i/caEXiC7-z2izww - 6 стадий принятия :)
+
+### Epic Fail: я понял, что product_id абсолютно не уникален. 
+
+**Придется все переделать :) lol**
+
+Я не уверен до конца, специально так планировалось, что мы должен решить эту проблему, или просто данные битые.
+НЕ совсем ясно, какое решение от нас ожидали. Мне на ум приходит собрать строки из всех параметров товара и наделать из них md5 ключей, а потом этим строкам
+выдать новые (условно product_id_uniq)
+
+**в итоге: **
+
+1. делаю таблицу сырых данных -> гружусь в нее
+
+```sql
+CREATE TABLE raw_transactions (
+    transaction_id int,
+    product_id int,
+    customer_id int,
+    transaction_date date,
+    online_order boolean,
+    order_status varchar(50),
+    brand varchar(100),
+    product_line varchar(50),
+    product_class varchar(50),
+    product_size varchar(50),
+    list_price numeric,
+    standard_cost numeric
+);
+```
+
+Скрин:
+https://disk.yandex.ru/i/h2DNvfIoVqnUFQ 
+
+Импортирую все данные:
+https://disk.yandex.ru/i/OhEWde1KrKeizw
+
+2. делаю доп поле, чтобы туда загнать хеши:
+
+https://disk.yandex.ru/i/63d4eMF0-tQT7w 
+
+тут пришлось погуглить (coalesce для null значений, ::text для перевода чисел в строки)
+
+```sql
+UPDATE raw_transactions
+SET product_hash_uid = md5(
+    coalesce(brand, '') ||
+    coalesce(product_line, '') ||
+    coalesce(product_class, '') ||
+    coalesce(product_size, '') ||
+    coalesce(list_price::text, '') ||
+    coalesce(standard_cost::text, '')
+);
+```
+
+Скрин:
+https://disk.yandex.ru/i/iSlVTnS6_bGyEA
+
+Вроде все ОК: 
+https://disk.yandex.ru/i/0jE0pdLpt3unIA
+
+3. Собираем новую таблицу
+
+```sql
+CREATE TABLE products_clean (
+    product_uid varchar(32) PRIMARY KEY,
+    brand varchar(100),
+    product_line varchar(50),
+    product_class varchar(50),
+    product_size varchar(50),
+    list_price numeric(10,2),
+    standard_cost numeric(10,2)
+);
+```
+
+Скрин:
+https://disk.yandex.ru/i/fkqZdbkup_uZaQ
+
+и заполняем ее уник строками товаров:
+
+```sql
+INSERT INTO products_clean (
+    product_uid,
+    brand,
+    product_line,
+    product_class,
+    product_size,
+    list_price,
+    standard_cost
+)
+SELECT DISTINCT
+    product_hash_uid AS product_uid,
+    brand,
+    product_line,
+    product_class,
+    product_size,
+    list_price,
+    standard_cost
+FROM raw_transactions;
+```
+
+Скрин:
+https://disk.yandex.ru/i/RUSbITOcfwIk7Q
+
+данные занесены в таблицу:
+https://disk.yandex.ru/i/zw7nyTZ7tJCzoQ
+
+4. Собираем таблицу транзакций, связанную с новой таблицей продуктов:
+
+Скрин:
+https://disk.yandex.ru/i/C2o5bPolso1qSA 
+
+```sql
+CREATE TABLE transactions_clean (
+    transaction_id int PRIMARY KEY,
+
+    product_uid varchar(32) NOT NULL,
+    customer_id int NOT NULL,
+
+    transaction_date date NOT NULL,
+
+    online_order boolean,
+    order_status varchar(50),
+
+    FOREIGN KEY (product_uid) REFERENCES products_clean(product_uid),
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+);
+```
+
+наполняем ее :
+
+*Данные оказались чуть битые:*  https://disk.yandex.ru/i/UwZIZPjU35pKIg 
+
+Всего таких строк оказалось три: https://disk.yandex.ru/i/ezCaAsV9nGDaXw 
+
+**Поправил их руками:**
+
+```sql
+UPDATE raw_transactions
+SET customer_id = 1
+WHERE customer_id = 5034;
+```
+Скрин: https://disk.yandex.ru/i/ZR9Efda6S_2VAg
+
+
+Собираем таблицу:
+
+```sql
+INSERT INTO transactions_clean (
+    transaction_id,
+    product_uid,
+    customer_id,
+    transaction_date,
+    online_order,
+    order_status
+)
+SELECT
+    transaction_id,
+    product_hash_uid AS product_uid,
+    customer_id,
+    transaction_date,
+    online_order,
+    order_status
+FROM raw_transactions;
+```
+
+Скрин (всего 20 000 строк, как и было в сырых данных, до перелопачивания :)
+https://disk.yandex.ru/i/j8b1LIyvEzHGWg
+
+
+Теперь формат данных норм.
+
+## Обновленная схема:
+
+https://disk.yandex.ru/i/FWWNIyBPtnd7Iw
